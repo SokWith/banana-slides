@@ -1,7 +1,7 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Sparkles, FileText, FileEdit } from 'lucide-react';
-import { Button, Textarea, Card, useToast } from '@/components/shared';
+import { Sparkles, FileText, FileEdit, ImagePlus } from 'lucide-react';
+import { Button, Textarea, Card, useToast, MaterialGeneratorModal } from '@/components/shared';
 import { TemplateSelector } from '@/components/shared/TemplateSelector';
 import { useProjectStore } from '@/store/useProjectStore';
 
@@ -17,6 +17,24 @@ export const Home: React.FC = () => {
   const [selectedTemplate, setSelectedTemplate] = useState<File | null>(null);
   const [selectedTemplateId, setSelectedTemplateId] = useState<string | null>(null);
   const [selectedPresetTemplateId, setSelectedPresetTemplateId] = useState<string | null>(null);
+  const [isMaterialModalOpen, setIsMaterialModalOpen] = useState(false);
+  const [currentProjectId, setCurrentProjectId] = useState<string | null>(null);
+
+  // 检查是否有当前项目
+  useEffect(() => {
+    const projectId = localStorage.getItem('currentProjectId');
+    setCurrentProjectId(projectId);
+  }, []);
+
+  const handleOpenMaterialModal = () => {
+    const projectId = localStorage.getItem('currentProjectId');
+    if (!projectId) {
+      show({ message: '请先创建一个项目', type: 'info' });
+      return;
+    }
+    setCurrentProjectId(projectId);
+    setIsMaterialModalOpen(true);
+  };
 
   const tabConfig = {
     idea: {
@@ -110,6 +128,14 @@ export const Home: React.FC = () => {
             <span className="text-xl font-bold text-gray-900">蕉幻</span>
           </div>
           <div className="flex items-center gap-4">
+            <Button
+              variant="ghost"
+              size="sm"
+              icon={<ImagePlus size={18} />}
+              onClick={handleOpenMaterialModal}
+            >
+              素材生成
+            </Button>
             <Button variant="ghost" size="sm" onClick={() => navigate('/history')}>
               历史项目
             </Button>
@@ -126,7 +152,7 @@ export const Home: React.FC = () => {
             🍌 蕉幻 Banana Slides
           </h1>
           <p className="text-xl text-gray-600">
-            AI 原生 PPT 生成器，一句话创造精彩
+            Vibe your PPT like vibing code
           </p>
         </div>
 
@@ -177,6 +203,7 @@ export const Home: React.FC = () => {
               selectedTemplateId={selectedTemplateId}
               selectedPresetTemplateId={selectedPresetTemplateId}
               showUpload={true} // 在主页上传的模板保存到用户模板库
+              projectId={currentProjectId}
             />
           </div>
 
@@ -194,6 +221,14 @@ export const Home: React.FC = () => {
         </Card>
       </main>
       <ToastContainer />
+      {/* 素材生成模态 */}
+      {currentProjectId && (
+        <MaterialGeneratorModal
+          projectId={currentProjectId}
+          isOpen={isMaterialModalOpen}
+          onClose={() => setIsMaterialModalOpen(false)}
+        />
+      )}
     </div>
   );
 };
