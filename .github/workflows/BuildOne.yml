@@ -1,0 +1,11 @@
+- name: Build and push Combined Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile.combined  # 使用新创建的合并版文件
+          push: true
+          build-args: |
+            VITE_API_BASE_URL=/api
+          tags: |
+            ${{ env.IMAGE_ID }}:latest
+            ${{ env.IMAGE_ID }}:${{ github.sha }}
