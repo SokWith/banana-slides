@@ -1,34 +1,37 @@
 # === 阶段 1: 前端构建 (frontend-builder) ===
 FROM node:18-alpine AS frontend-builder
 WORKDIR /app
-
-# 1. 拷贝前端依赖文件 (注意：没有开头的斜杠)
 COPY frontend/package*.json ./
 RUN npm install
-
-# 2. 拷贝前端所有源码并构建
 COPY frontend/ .
 ARG VITE_API_BASE_URL=/api
 RUN npm run build
 
-# === 阶段 2: 后端与合并运行 (final) ===
+# === 阶段 2: 后端与合并运行 (Final) ===
 FROM python:3.10-slim
 WORKDIR /app
 
-# 3. 安装后端依赖 (使用相对路径)
-# 这里的 backend/requirements.txt 是相对于项目根目录的
-COPY backend/requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# 安装 Poetry
+RUN pip install --no-cache-dir poetry
 
-# 4. 拷贝后端源码
+# 1. 拷贝 Poetry 配置文件（这是项目里实际存在的文件）
+COPY backend/pyproject.toml backend/poetry.lock* ./backend/
+
+# 2. 安装后端依赖 (不创建虚拟环境，直接装在系统镜像里)
+WORKDIR /app/backend
+RUN poetry config virtualenvs.create false \
+    && poetry install --no-interaction --no-ansi --no-root
+
+# 3. 拷贝后端源码
+WORKDIR /app
 COPY backend/ ./backend/
 
-# 5. 关键：将前端构建出的 dist 目录拷贝到后端静态资源文件夹
-# 这里的 /app/dist 是前端阶段生成的路径
-# backend/static 是后端代码中托管静态文件的目录
-COPY --from=frontend-builder /app/dist ./backend/static
+# 4. 拷贝前端静态文件到后端指定目录
+# 注意：该项目后端通常托管在 backend/static 目录下
+COPY --from=frontend-builder /app/frontend/dist ./backend/static
 
-# 6. 设置环境变量并启动
+# 5. 设置环境变量并启动
 ENV PORT=5000
 EXPOSE 5000
+# 根据项目结构，启动命令通常是运行 backend/app.py
 CMD ["python", "backend/app.py"]
