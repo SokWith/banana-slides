@@ -1,37 +1,39 @@
-# === 阶段 1: 前端构建 (frontend-builder) ===
+# === 阶段 1: 前端构建 ===
 FROM node:18-alpine AS frontend-builder
 WORKDIR /app
-COPY frontend/package*.json ./
-RUN npm install
-COPY frontend/ .
+# 根据你的 docker-compose，上下文是根目录，所以路径是 frontend/
+COPY frontend/package*.json ./frontend/
+RUN cd frontend && npm install
+COPY frontend/ ./frontend/
 ARG VITE_API_BASE_URL=/api
-RUN npm run build
+RUN cd frontend && npm run build
 
-# === 阶段 2: 后端与合并运行 (Final) ===
+# === 阶段 2: 构建后端并合并 ===
 FROM python:3.10-slim
 WORKDIR /app
 
 # 安装 Poetry
 RUN pip install --no-cache-dir poetry
 
-# 1. 拷贝 Poetry 配置文件（这是项目里实际存在的文件）
+# 1. 拷贝后端依赖文件 (路径必须是 backend/...)
+# 注意：这里不加开头的斜杠
 COPY backend/pyproject.toml backend/poetry.lock* ./backend/
 
-# 2. 安装后端依赖 (不创建虚拟环境，直接装在系统镜像里)
+# 2. 安装 Python 依赖
 WORKDIR /app/backend
 RUN poetry config virtualenvs.create false \
     && poetry install --no-interaction --no-ansi --no-root
 
-# 3. 拷贝后端源码
+# 3. 拷贝后端所有源码
 WORKDIR /app
 COPY backend/ ./backend/
 
-# 4. 拷贝前端静态文件到后端指定目录
-# 注意：该项目后端通常托管在 backend/static 目录下
-COPY --from=frontend-builder /app/frontend/dist ./backend/static
+# 4. 重点：合并前端产物
+# 根据 Vite 默认配置，产物在 frontend/dist
+RUN mkdir -p backend/static
+COPY --from=frontend-builder /app/frontend/dist/ ./backend/static/
 
-# 5. 设置环境变量并启动
-ENV PORT=5000
+# 5. 启动配置
 EXPOSE 5000
-# 根据项目结构，启动命令通常是运行 backend/app.py
+# 启动路径必须指向 backend 文件夹内的入口
 CMD ["python", "backend/app.py"]
