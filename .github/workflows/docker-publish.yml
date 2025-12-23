@@ -1,31 +1,53 @@
-name: Build and Push Docker Image
+name: Build and Publish Banana Slides Image
 
+# 触发条件：当代码推送到 main 分支，或者手动在 Actions 页面点击运行
 on:
   push:
-    branches: [ "main" ]  # 当代码推送到 main 分支时触发
+    branches: [ "main" ]
+  workflow_dispatch:
 
 jobs:
-  build:
+  build-and-push:
     runs-on: ubuntu-latest
+    
+    # 设置权限，必须包含 packages: write 才能推送镜像
     permissions:
       contents: read
       packages: write
 
     steps:
+      # 1. 拉取源代码
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Log in to GitHub Container Registry
+      # 2. 将仓库名转换为全小写（解决你之前遇到的 SokWith 大写报错问题）
+      - name: Lowercase registry address
+        run: |
+          echo "IMAGE_NAME=ghcr.io/${{ github.repository_owner }}/banana-slides" | tr '[:upper:]' '[:lower:]' >> $GITHUB_ENV
+
+      # 3. 设置 Docker Buildx (支持更高级的构建功能)
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # 4. 登录到 GitHub Container Registry (GHCR)
+      - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # 5. 构建并推送镜像
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
           context: .
+          file: ./Dockerfile  # 确保你的项目根目录下有这个文件
           push: true
-          # 这里的镜像名称格式为 ghcr.io/你的用户名/项目名:latest
-          tags: ghcr.io/sokwith/banana-slides:latest
+          # 标签包含 latest 和 短哈希值，方便版本回溯
+          tags: |
+            ${{ env.IMAGE_NAME }}:latest
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          # 缓存优化：加快下次构建速度
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
