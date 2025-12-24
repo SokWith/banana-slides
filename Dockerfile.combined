@@ -1,7 +1,6 @@
 # === 阶段 1: 前端构建 ===
 FROM node:18-alpine AS frontend-builder
 WORKDIR /app
-# 按照前端 Dockerfile 逻辑
 COPY frontend/package*.json ./frontend/
 RUN cd frontend && npm install
 COPY frontend/ ./frontend/
@@ -12,7 +11,7 @@ RUN cd frontend && npm run build
 FROM python:3.10-slim
 WORKDIR /app
 
-# 1. 安装依赖 (原版列表 + 补齐缺失的 sqlalchemy 系列)
+# 1. 彻底补全 app.py 涉及的所有依赖
 RUN pip install --no-cache-dir \
     flask \
     flask-cors \
@@ -22,19 +21,25 @@ RUN pip install --no-cache-dir \
     pillow \
     tenacity \
     sqlalchemy \
-    flask-sqlalchemy
+    flask-sqlalchemy \
+    flask-migrate \
+    flask-marshmallow \
+    marshmallow-sqlalchemy
 
-# 2. 拷贝后端源码 (模仿原版：将 backend 目录下的内容直接放入 /app)
+# 2. 拷贝后端源码
+# 根据 app.py 第 24 行的导入逻辑，源码必须保持原有目录结构
 COPY backend/ .
 
 # 3. 托管前端静态文件
-# 将前端构建好的 dist 文件夹拷贝到后端寻找静态文件的默认目录 'static'
+# app.py 默认会寻找同级目录下的 static 文件夹
 RUN mkdir -p static
 COPY --from=frontend-builder /app/frontend/dist/ ./static/
 
 # 4. 运行配置
 ENV PORT=5000
+# 关键：设置 PYTHONPATH 确保 app.py 能找到 controllers, services 等文件夹
+ENV PYTHONPATH=/app
 EXPOSE 5000
 
-# 直接运行，因为源码已经考到了 /app 根目录
+# 启动
 CMD ["python", "app.py"]
