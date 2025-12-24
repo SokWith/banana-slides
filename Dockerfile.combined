@@ -1,109 +1,112 @@
-# === 阶段 1: 前端构建 (Vite/React/Vue) ===
+# === 阶段 1: 前端构建 ===
 FROM node:18-alpine AS frontend-builder
 WORKDIR /app/frontend
 COPY frontend/package*.json ./
-# 使用 legacy-peer-deps 减少依赖冲突
 RUN npm install --prefer-offline --no-audit --legacy-peer-deps
 COPY frontend/ ./
-# 关键：Vite 构建时需要知道 API 的相对根路径
 ARG VITE_API_BASE_URL=/api
 RUN CI=false npm run build
 
-# === 阶段 2: 后端依赖准备 ===
+# === 阶段 2: 后端依赖 ===
 FROM python:3.10-slim AS builder-backend
 WORKDIR /app
 RUN pip install --no-cache-dir pipreqs
 COPY backend/ ./backend/
-# 自动生成并安装依赖，补充缺失的常用库
 RUN pipreqs ./backend --force && \
     pip install --no-cache-dir -r ./backend/requirements.txt && \
     pip install --no-cache-dir python-pptx google-genai openai flask-sqlalchemy flask-migrate flask-cors werkzeug
 
-# === 阶段 3: 最终运行镜像 ===
+# === 阶段 3: 运行阶段 ===
 FROM python:3.10-slim
 WORKDIR /app
 
-# 从之前的阶段拷贝环境和代码
 COPY --from=builder-backend /usr/local/lib/python3.10/site-packages /usr/local/lib/python3.10/site-packages
 COPY --from=builder-backend /usr/local/bin /usr/local/bin
 COPY backend/ .
 
-# 准备静态文件目录
+# 准备静态文件
 RUN mkdir -p /app/static
 COPY --from=frontend-builder /app/frontend/dist/ /app/static/
 
-# --- 创建万能启动脚本 hf_runner.py ---
+# --- 创建增强版启动脚本 ---
 RUN cat <<EOF > hf_runner.py
 import os
 import sys
-import traceback
 from flask import Flask, send_from_directory
 from flask_cors import CORS
 
-# 1. 加载原始后端应用
+# 1. 加载应用
 sys.path.append(os.getcwd())
 try:
     from app import app, db
-    print("Original app loaded successfully.")
+    print("Backend app loaded.")
 except Exception as e:
-    print(f"Error loading original app: {e}")
-    traceback.print_exc()
+    print(f"Critical Load Error: {e}")
     sys.exit(1)
 
 CORS(app)
-app.static_folder = os.path.abspath('static')
+# 绝对路径锁定
+STATIC_AUTH_DIR = os.path.abspath('static')
+app.static_folder = STATIC_AUTH_DIR
 
-# 2. 定义强健的兜底转发函数
+# 2. 深度穿透的文件分发函数
 def catch_all_optimized(path=''):
-    # 物理路径检查
-    full_path = os.path.join(app.static_folder, path)
+    # 确保路径安全
+    normalized_path = path.strip("/")
+    full_path = os.path.join(STATIC_AUTH_DIR, normalized_path)
     
-    # 如果是访问现有的静态文件 (js, css, images)
-    if path != "" and os.path.exists(full_path):
-        return send_from_directory(app.static_folder, path)
-    
-    # 如果是 API 请求但走到了这里，说明后端路由没匹配上
+    # 调试日志：如果还是404，可以在HF日志里看它在找哪里
+    # print(f"Request Path: {path} -> Checking: {full_path}")
+
+    # 情况 A: 访问根目录
+    if not path or path == '/':
+        return send_from_directory(STATIC_AUTH_DIR, 'index.html')
+
+    # 情况 B: 访问物理存在的文件 (assets/xxx.js, logo.png 等)
+    if os.path.exists(full_path) and os.path.isfile(full_path):
+        return send_from_directory(os.path.dirname(full_path), os.path.basename(full_path))
+
+    # 情况 C: API 请求但文件不存在（交给后端逻辑或报404）
     if path.startswith('api/'):
-        return {"error": "API endpoint not found"}, 404
-    
-    # 其余所有情况（包括根路径 /）全部返回前端 index.html
-    return send_from_directory(app.static_folder, 'index.html')
+        return {"error": "API route not found"}, 404
+
+    # 情况 D: 前端路由刷新 (例如 /dashboard)，没有文件后缀的请求统一回向 index.html
+    if '.' not in os.path.basename(path):
+        return send_from_directory(STATIC_AUTH_DIR, 'index.html')
+
+    return f"Asset not found: {path}", 404
 
 if __name__ == '__main__':
-    # 3. 数据库初始化补丁
+    # 3. 数据库初始化
     with app.app_context():
         try:
             db.create_all()
-            print("Database tables created/verified.")
+            print("Database check: OK.")
         except Exception as e:
-            print(f"DB Note: {e}")
+            print(f"Database Note: {e}")
 
-    # 4. 路由“防崩”补丁：修复 KeyError 和 TypeError
-    print("Patching routing table...")
+    # 4. 路由补丁：解决 KeyError 和子目录 404
     app.view_functions['catch_all_optimized'] = catch_all_optimized
 
     for rule in list(app.url_map.iter_rules()):
-        # 修复根路径请求
-        if rule.rule == '/':
-            app.view_functions[rule.endpoint] = lambda: catch_all_optimized('')
+        # 统一劫持根路由和幽灵路由
+        if rule.rule == '/' or rule.endpoint not in app.view_functions:
+            app.view_functions[rule.endpoint] = lambda **kwargs: catch_all_optimized(kwargs.get('path', ''))
         
-        # 修复带变量的路径请求
+        # 劫持所有带 path 的静态分发
         elif '<path:path>' in rule.rule:
             app.view_functions[rule.endpoint] = catch_all_optimized
-            
-        # 修复那些规则存在但函数丢失的“幽灵路由”
-        elif rule.endpoint not in app.view_functions:
-            app.view_functions[rule.endpoint] = lambda **kwargs: catch_all_optimized(kwargs.get('path', ''))
 
-    print("Final Server starting on port 7860...")
+    print("Checking static files structure:")
+    for root, dirs, files in os.walk(STATIC_AUTH_DIR):
+        for f in files: print(f" - Found: {os.path.join(root, f)}")
+
     app.run(host='0.0.0.0', port=7860, threaded=True)
 EOF
 
-# 设置权限和环境变量
 RUN chmod -R 777 /app
 ENV PORT=7860
 ENV PYTHONPATH=/app
 EXPOSE 7860
 
-# 启动！
 CMD ["python", "hf_runner.py"]
