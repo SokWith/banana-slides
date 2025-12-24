@@ -1,46 +1,40 @@
 # === 阶段 1: 前端构建 ===
 FROM node:18-alpine AS frontend-builder
 WORKDIR /app
+# 拷贝前端代码
 COPY frontend/package*.json ./frontend/
 RUN cd frontend && npm install
 COPY frontend/ ./frontend/
+# 执行构建
 ARG VITE_API_BASE_URL=/api
 RUN cd frontend && npm run build
 
-# === 阶段 2: 后端与合并 ===
+# === 阶段 2: 后端与运行 (基于原版 backend/Dockerfile 逻辑) ===
 FROM python:3.10-slim
 WORKDIR /app
 
-# 1. 安装后端 Python 依赖库
-# 补齐了之前报错的 tenacity，以及根据代码路径推测出的相关库
+# 1. 安装原版指定的后端依赖
 RUN pip install --no-cache-dir \
     flask \
     flask-cors \
-    flask-sqlalchemy \
-    flask-migrate \
-    sqlalchemy \
-    python-dotenv \
     requests \
     google-generativeai \
+    python-dotenv \
     pillow \
-    tenacity \
-    marshmallow \
-    flask-marshmallow \
-    marshmallow-sqlalchemy
+    tenacity
 
-# 2. 拷贝后端源码
-COPY backend/ /app/backend/
+# 2. 拷贝后端源码到容器的 /app 目录下
+# 注意：原版 Dockerfile 是把 backend 下的内容考到 WORKDIR
+COPY backend/ .
 
-# 3. 合并前端产物
-RUN mkdir -p /app/backend/static
-COPY --from=frontend-builder /app/frontend/dist/ /app/backend/static/
+# 3. 处理前端静态文件
+# 强制创建静态目录并将前端产物拷贝进去
+RUN mkdir -p static
+COPY --from=frontend-builder /app/frontend/dist/ ./static/
 
 # 4. 运行配置
 ENV PORT=5000
 EXPOSE 5000
 
-# 切换到后端目录启动
-WORKDIR /app/backend
-# 增加 PYTHONPATH 确保能够正确导入同级目录下的 controllers, services 等模块
-ENV PYTHONPATH=/app/backend
+# 5. 启动 (参考原版，直接在根目录下运行 app.py)
 CMD ["python", "app.py"]
