@@ -20,45 +20,54 @@ RUN pipreqs ./backend --force && \
 FROM python:3.10-slim
 WORKDIR /app
 
+# 拷贝环境
 COPY --from=builder-backend /usr/local/lib/python3.10/site-packages /usr/local/lib/python3.10/site-packages
 COPY --from=builder-backend /usr/local/bin /usr/local/bin
+# 拷贝后端代码
 COPY backend/ .
 
-# 1. 准备前端静态文件
+# 准备静态文件
 RUN mkdir -p static
 COPY --from=frontend-builder /app/frontend/dist/ ./static/
 
-# 2. 【核心修复】强行改写 app.py，避开路由冲突
-# - 将 @app.route("/") 改为 @app.route("/api/info_status")，释放根路径
-# - 强制修改 app 初始化，加入 static 路径配置
-RUN sed -i 's/@app.route("/")/@app.route("\/api\/info_status")/g' app.py && \
-    sed -i 's/app = Flask(__name__)/app = Flask(__name__, static_folder="static", static_url_path="\/")/g' app.py
-
-# 3. 【核心修复】创建一个干净的引导程序，手动注入前端路由
+# --- 核心：创建启动脚本 (hf_start.py) ---
+# 此脚本通过动态修改 app 对象的 view_functions 来解除根路由占用
 RUN printf "import os\n\
 from flask import send_from_directory\n\
 from app import app, db\n\
 \n\
-# 自动建表\n\
+# 1. 强制重置静态文件路径\n\
+app.static_folder = 'static'\n\
+app.static_url_path = '/'\n\
+\n\
+# 2. 移除原有的根路由限制 (解除 JSON 输出的占用)\n\
+if '/' in app.view_functions:\n\
+    app.view_functions.pop('/')\n\
+\n\
+# 3. 自动初始化数据库\n\
 with app.app_context():\n\
     try: db.create_all()\n\
     except: pass\n\
 \n\
-# 手动添加前端托管路由（此时 / 已经空出来了）\n\
+# 4. 重新定义根路由服务前端\n\
 @app.route('/', defaults={'path': ''})\n\
 @app.route('/<path:path>')\n\
 def serve(path):\n\
-    if path != '' and os.path.exists(os.path.join(app.static_folder, path)):\n\
+    full_path = os.path.join(app.static_folder, path)\n\
+    if path != '' and os.path.exists(full_path):\n\
         return send_from_directory(app.static_folder, path)\n\
     return send_from_directory(app.static_folder, 'index.html')\n\
 \n\
 if __name__ == '__main__':\n\
-    app.run(host='0.0.0.0', port=7860)\n\
-" > hf_runner.py
+    # 适配 Hugging Face 端口\n\
+    port = int(os.environ.get('PORT', 7860))\n\
+    app.run(host='0.0.0.0', port=port)\n\
+" > hf_start.py
 
+# 设置权限
 RUN chmod -R 777 /app
 ENV PORT=7860
 ENV PYTHONPATH=/app
 EXPOSE 7860
 
-CMD ["python", "hf_runner.py"]
+CMD ["python", "hf_start.py"]
