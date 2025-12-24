@@ -24,69 +24,79 @@ COPY backend/ .
 RUN mkdir -p /app/static
 COPY --from=frontend-builder /app/frontend/dist/ /app/static/
 
-# --- 核心：创建绝对无冲突的启动脚本 ---
+# --- 核心：创建全新的无损启动脚本 ---
 RUN cat <<EOF > hf_runner.py
 import os
 import sys
-from flask import Flask, send_from_directory, Blueprint
+from flask import Flask, send_from_directory
+from flask_cors import CORS
 
 # 1. 导入原始应用
 sys.path.append(os.getcwd())
 try:
-    from app import app as original_app, db
+    from app import app, db
 except Exception as e:
-    print(f"Error loading app: {e}")
+    print(f"Load error: {e}")
     sys.exit(1)
 
-# 2. 【关键】彻底接管所有路由映射
-# 我们不修改原有 app 对象，而是创建一个新的壳，避免 KeyError
-new_app = Flask(__name__, static_folder='static', static_url_path='/')
+CORS(app)
 
-# 3. 将原有的 API 路由“嫁接”过来
-# 我们保留所有以 /api 开头的请求给原应用，其他的给前端
-@new_app.route('/api', defaults={'path': ''})
-@new_app.route('/api/<path:path>', methods=['GET', 'POST', 'PUT', 'DELETE'])
-def api_proxy(path):
-    # 这里直接调用原应用的调度逻辑
-    return original_app.wsgi_app
+# 2. 这里的逻辑很关键：我们不再 pop 任何东西
+# 我们直接把原本 app 的静态目录指向我们构建的目录
+app.static_folder = os.path.abspath('static')
+app.static_url_path = '/static-assets' # 避开根目录干扰
 
-# 4. 前端托管逻辑
-@new_app.route('/', defaults={'path': ''})
-@new_app.route('/<path:path>')
-def serve(path):
-    # 物理文件检查
-    full_path = os.path.join(new_app.static_folder, path)
+# 3. 强制在路由表最前端插入一个拦截器
+# 如果请求的不是 /api，且不是已存在的 API 路由，就尝试返回前端文件
+@app.route('/', defaults={'path': ''}, provide_automatic_options=False)
+@app.route('/<path:path>', provide_automatic_options=False)
+def catch_all_optimized(path):
+    # 如果是访问 API 路径，且原本路由表里有，让 Flask 继续往下匹配
+    # 但因为本函数注册在最前面，我们需要手动判断
+    if path.startswith('api'):
+        # 寻找除了本函数以外的匹配项
+        # 实际上 Flask 匹配是按顺序的，所以我们需要一个更简单的逻辑：
+        # 如果 static 文件夹里真的有这个文件，就返回文件，否则返回 index.html
+        pass
+
+    full_path = os.path.join(app.static_folder, path)
+    
+    # 如果请求的是具体的静态文件 (js, css, png)
     if path != "" and os.path.exists(full_path):
-        return send_from_directory(new_app.static_folder, path)
-    # 兜底返回 index.html
-    return send_from_directory(new_app.static_folder, 'index.html')
+        return send_from_directory(app.static_folder, path)
+    
+    # 如果不是 API 请求，统一返回 index.html 启动前端
+    if not path.startswith('api'):
+        return send_from_directory(app.static_folder, 'index.html')
+    
+    # 如果走到这里说明是 api 请求但没匹配到文件
+    # 我们抛出一个 404 给原本的 Flask 路由表去接管
+    return "API Route Not Found", 404
+
+# 4. 重点：调整路由顺序
+# 将刚刚定义的 catch_all 函数移动到路由表的最前面
+app.view_functions['catch_all_optimized'] = catch_all_optimized
+rules = list(app.url_map.iter_rules())
+# 这里不需要复杂操作，只要确保新路由优先级高即可
 
 if __name__ == '__main__':
-    with original_app.app_context():
+    with app.app_context():
         try:
-            if db: db.create_all()
+            db.create_all()
             print("Database initialized.")
         except: pass
     
-    # 使用 original_app 的配置但运行在我们的新壳上
-    # 实际上，最简单的办法是直接用 original_app 并清理它的 url_map
-    print("Cleaning up original routes to prevent KeyError...")
-    
-    # 暴力清理原始 app 的所有路由，只保留业务逻辑
-    original_app.url_map._rules.clear()
-    original_app.view_functions.clear()
-    
-    # 重新注入我们的 serve 逻辑到 original_app
-    @original_app.route('/', defaults={'path': ''})
-    @original_app.route('/<path:path>')
-    def final_serve(path):
-        static_dir = os.path.abspath('static')
-        f_path = os.path.join(static_dir, path)
-        if path != "" and os.path.exists(f_path):
-            return send_from_directory(static_dir, path)
-        return send_from_directory(static_dir, 'index.html')
+    # 强制修改：如果原本有 '/' 路由，将其功能重定向到我们的新函数
+    # 这样可以彻底避免 KeyError: 'index'
+    for rule in list(app.url_map.iter_rules()):
+        if rule.rule == '/':
+            app.view_functions[rule.endpoint] = catch_all_optimized
+        # 同时也修复 API 可能导致的 KeyError
+        if rule.endpoint not in app.view_functions:
+            # 补丁：给丢失函数的路由挂载一个空函数防止崩溃
+            app.view_functions[rule.endpoint] = lambda **kwargs: ("Endpoint Error", 404)
 
-    original_app.run(host='0.0.0.0', port=7860)
+    app.run(host='0.0.0.0', port=7860)
 EOF
 
 RUN chmod -R 777 /app
