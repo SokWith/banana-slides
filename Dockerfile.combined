@@ -7,29 +7,28 @@ COPY frontend/ ./
 ARG VITE_API_BASE_URL=/api
 RUN CI=false npm run build
 
-# === 阶段 2: 后端依赖扫描与安装 ===
+# === 阶段 2: 后端与运行 ===
 FROM python:3.10-slim
 WORKDIR /app
 
-# 安装扫描工具
-RUN pip install --no-cache-dir pipreqs
+# 1. 一次性补全所有发现的依赖（包括最新的 python-pptx）
+RUN pip install --no-cache-dir \
+    flask flask-cors requests python-dotenv pillow tenacity \
+    sqlalchemy flask-sqlalchemy flask-migrate flask-marshmallow \
+    marshmallow-sqlalchemy google-genai openai python-pptx
 
-# 拷贝后端代码进行扫描
-COPY backend/ ./backend/
-
-# 关键步骤：动态生成依赖列表并安装
-# 1. 用 pipreqs 扫描 backend 目录
-# 2. 手动补充一些 pipreqs 可能漏掉的特定包名（如 python-pptx）
-RUN pipreqs ./backend --force && \
-    pip install --no-cache-dir -r ./backend/requirements.txt && \
-    pip install --no-cache-dir python-pptx google-genai
-
-# === 阶段 3: 运行阶段 ===
-# 再次整理目录结构，确保 app.py 在根目录
+# 2. 拷贝后端源码
 COPY backend/ .
+
+# 3. 核心修复：修改 app.py 以支持前端托管
+# 我们把原有的根路由改为返回静态文件，或者直接删掉它让 Flask 使用默认静态逻辑
+RUN sed -i 's/return jsonify({/return app.send_static_file("index.html") #/g' app.py
+
+# 4. 托管前端静态文件
 RUN mkdir -p static
 COPY --from=frontend-builder /app/frontend/dist/ ./static/
 
+# 5. 运行配置
 ENV PORT=5000
 ENV PYTHONPATH=/app
 EXPOSE 5000
