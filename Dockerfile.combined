@@ -1,106 +1,109 @@
-# === 阶段 1 & 2 保持不变 ===
+# === 阶段 1: 前端构建 (Vite/React/Vue) ===
 FROM node:18-alpine AS frontend-builder
 WORKDIR /app/frontend
 COPY frontend/package*.json ./
+# 使用 legacy-peer-deps 减少依赖冲突
 RUN npm install --prefer-offline --no-audit --legacy-peer-deps
 COPY frontend/ ./
+# 关键：Vite 构建时需要知道 API 的相对根路径
 ARG VITE_API_BASE_URL=/api
 RUN CI=false npm run build
 
+# === 阶段 2: 后端依赖准备 ===
 FROM python:3.10-slim AS builder-backend
 WORKDIR /app
 RUN pip install --no-cache-dir pipreqs
 COPY backend/ ./backend/
+# 自动生成并安装依赖，补充缺失的常用库
 RUN pipreqs ./backend --force && \
     pip install --no-cache-dir -r ./backend/requirements.txt && \
-    pip install --no-cache-dir python-pptx google-genai openai flask-sqlalchemy flask-migrate flask-cors
+    pip install --no-cache-dir python-pptx google-genai openai flask-sqlalchemy flask-migrate flask-cors werkzeug
 
-# === 阶段 3: 运行阶段 ===
+# === 阶段 3: 最终运行镜像 ===
 FROM python:3.10-slim
 WORKDIR /app
+
+# 从之前的阶段拷贝环境和代码
 COPY --from=builder-backend /usr/local/lib/python3.10/site-packages /usr/local/lib/python3.10/site-packages
 COPY --from=builder-backend /usr/local/bin /usr/local/bin
 COPY backend/ .
+
+# 准备静态文件目录
 RUN mkdir -p /app/static
 COPY --from=frontend-builder /app/frontend/dist/ /app/static/
 
-# --- 核心：创建全新的无损启动脚本 ---
+# --- 创建万能启动脚本 hf_runner.py ---
 RUN cat <<EOF > hf_runner.py
 import os
 import sys
+import traceback
 from flask import Flask, send_from_directory
 from flask_cors import CORS
 
-# 1. 导入原始应用
+# 1. 加载原始后端应用
 sys.path.append(os.getcwd())
 try:
     from app import app, db
+    print("Original app loaded successfully.")
 except Exception as e:
-    print(f"Load error: {e}")
+    print(f"Error loading original app: {e}")
+    traceback.print_exc()
     sys.exit(1)
 
 CORS(app)
-
-# 2. 这里的逻辑很关键：我们不再 pop 任何东西
-# 我们直接把原本 app 的静态目录指向我们构建的目录
 app.static_folder = os.path.abspath('static')
-app.static_url_path = '/static-assets' # 避开根目录干扰
 
-# 3. 强制在路由表最前端插入一个拦截器
-# 如果请求的不是 /api，且不是已存在的 API 路由，就尝试返回前端文件
-@app.route('/', defaults={'path': ''}, provide_automatic_options=False)
-@app.route('/<path:path>', provide_automatic_options=False)
-def catch_all_optimized(path):
-    # 如果是访问 API 路径，且原本路由表里有，让 Flask 继续往下匹配
-    # 但因为本函数注册在最前面，我们需要手动判断
-    if path.startswith('api'):
-        # 寻找除了本函数以外的匹配项
-        # 实际上 Flask 匹配是按顺序的，所以我们需要一个更简单的逻辑：
-        # 如果 static 文件夹里真的有这个文件，就返回文件，否则返回 index.html
-        pass
-
+# 2. 定义强健的兜底转发函数
+def catch_all_optimized(path=''):
+    # 物理路径检查
     full_path = os.path.join(app.static_folder, path)
     
-    # 如果请求的是具体的静态文件 (js, css, png)
+    # 如果是访问现有的静态文件 (js, css, images)
     if path != "" and os.path.exists(full_path):
         return send_from_directory(app.static_folder, path)
     
-    # 如果不是 API 请求，统一返回 index.html 启动前端
-    if not path.startswith('api'):
-        return send_from_directory(app.static_folder, 'index.html')
+    # 如果是 API 请求但走到了这里，说明后端路由没匹配上
+    if path.startswith('api/'):
+        return {"error": "API endpoint not found"}, 404
     
-    # 如果走到这里说明是 api 请求但没匹配到文件
-    # 我们抛出一个 404 给原本的 Flask 路由表去接管
-    return "API Route Not Found", 404
-
-# 4. 重点：调整路由顺序
-# 将刚刚定义的 catch_all 函数移动到路由表的最前面
-app.view_functions['catch_all_optimized'] = catch_all_optimized
-rules = list(app.url_map.iter_rules())
-# 这里不需要复杂操作，只要确保新路由优先级高即可
+    # 其余所有情况（包括根路径 /）全部返回前端 index.html
+    return send_from_directory(app.static_folder, 'index.html')
 
 if __name__ == '__main__':
+    # 3. 数据库初始化补丁
     with app.app_context():
         try:
             db.create_all()
-            print("Database initialized.")
-        except: pass
-    
-    # 强制修改：如果原本有 '/' 路由，将其功能重定向到我们的新函数
-    # 这样可以彻底避免 KeyError: 'index'
-    for rule in list(app.url_map.iter_rules()):
-        if rule.rule == '/':
-            app.view_functions[rule.endpoint] = catch_all_optimized
-        # 同时也修复 API 可能导致的 KeyError
-        if rule.endpoint not in app.view_functions:
-            # 补丁：给丢失函数的路由挂载一个空函数防止崩溃
-            app.view_functions[rule.endpoint] = lambda **kwargs: ("Endpoint Error", 404)
+            print("Database tables created/verified.")
+        except Exception as e:
+            print(f"DB Note: {e}")
 
-    app.run(host='0.0.0.0', port=7860)
+    # 4. 路由“防崩”补丁：修复 KeyError 和 TypeError
+    print("Patching routing table...")
+    app.view_functions['catch_all_optimized'] = catch_all_optimized
+
+    for rule in list(app.url_map.iter_rules()):
+        # 修复根路径请求
+        if rule.rule == '/':
+            app.view_functions[rule.endpoint] = lambda: catch_all_optimized('')
+        
+        # 修复带变量的路径请求
+        elif '<path:path>' in rule.rule:
+            app.view_functions[rule.endpoint] = catch_all_optimized
+            
+        # 修复那些规则存在但函数丢失的“幽灵路由”
+        elif rule.endpoint not in app.view_functions:
+            app.view_functions[rule.endpoint] = lambda **kwargs: catch_all_optimized(kwargs.get('path', ''))
+
+    print("Final Server starting on port 7860...")
+    app.run(host='0.0.0.0', port=7860, threaded=True)
 EOF
 
+# 设置权限和环境变量
 RUN chmod -R 777 /app
 ENV PORT=7860
+ENV PYTHONPATH=/app
 EXPOSE 7860
 
+# 启动！
 CMD ["python", "hf_runner.py"]
