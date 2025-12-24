@@ -24,11 +24,11 @@ COPY --from=builder-backend /usr/local/lib/python3.10/site-packages /usr/local/l
 COPY --from=builder-backend /usr/local/bin /usr/local/bin
 COPY backend/ .
 
-# 准备静态文件
-RUN mkdir -p /app/static
-COPY --from=frontend-builder /app/frontend/dist/ /app/static/
+# 关键：我们将前端 dist 直接重命名为 backend 下的 static 文件夹
+RUN rm -rf static && mkdir -p static
+COPY --from=frontend-builder /app/frontend/dist/ ./static/
 
-# --- 创建增强版启动脚本 ---
+# --- 创建启动脚本 ---
 RUN cat <<EOF > hf_runner.py
 import os
 import sys
@@ -41,72 +41,48 @@ try:
     from app import app, db
     print("Backend app loaded.")
 except Exception as e:
-    print(f"Critical Load Error: {e}")
+    print(f"Error: {e}")
     sys.exit(1)
 
 CORS(app)
-# 绝对路径锁定
-STATIC_AUTH_DIR = os.path.abspath('static')
-app.static_folder = STATIC_AUTH_DIR
 
-# 2. 深度穿透的文件分发函数
-def catch_all_optimized(path=''):
-    # 确保路径安全
-    normalized_path = path.strip("/")
-    full_path = os.path.join(STATIC_AUTH_DIR, normalized_path)
-    
-    # 调试日志：如果还是404，可以在HF日志里看它在找哪里
-    # print(f"Request Path: {path} -> Checking: {full_path}")
+# 2. 【核心点】强制配置 Flask 原生静态分发
+# 把 static 文件夹作为根路径分发
+app.static_folder = os.path.abspath('static')
+app.static_url_path = '/' 
 
-    # 情况 A: 访问根目录
-    if not path or path == '/':
-        return send_from_directory(STATIC_AUTH_DIR, 'index.html')
+# 3. 拦截所有不匹配的路由，返回 index.html (支持 SPA)
+@app.errorhandler(404)
+def handle_404(e):
+    # 如果是 API 报错，返回 JSON
+    if request.path.startswith('/api'):
+        return {"error": "Not found"}, 404
+    # 否则返回前端入口
+    return send_from_directory(app.static_folder, 'index.html')
 
-    # 情况 B: 访问物理存在的文件 (assets/xxx.js, logo.png 等)
-    if os.path.exists(full_path) and os.path.isfile(full_path):
-        return send_from_directory(os.path.dirname(full_path), os.path.basename(full_path))
-
-    # 情况 C: API 请求但文件不存在（交给后端逻辑或报404）
-    if path.startswith('api/'):
-        return {"error": "API route not found"}, 404
-
-    # 情况 D: 前端路由刷新 (例如 /dashboard)，没有文件后缀的请求统一回向 index.html
-    if '.' not in os.path.basename(path):
-        return send_from_directory(STATIC_AUTH_DIR, 'index.html')
-
-    return f"Asset not found: {path}", 404
+# 4. 补齐首页路由（防止被原有逻辑拦截）
+@app.route('/')
+def hf_index():
+    return send_from_directory(app.static_folder, 'index.html')
 
 if __name__ == '__main__':
-    # 3. 数据库初始化
     with app.app_context():
         try:
             db.create_all()
-            print("Database check: OK.")
-        except Exception as e:
-            print(f"Database Note: {e}")
+            print("Database ready.")
+        except: pass
 
-    # 4. 路由补丁：解决 KeyError 和子目录 404
-    app.view_functions['catch_all_optimized'] = catch_all_optimized
+    # 打印一下物理路径确保万无一失
+    asset_path = os.path.join(app.static_folder, 'assets')
+    if os.path.exists(asset_path):
+        print(f"Assets dir content: {os.listdir(asset_path)}")
 
-    for rule in list(app.url_map.iter_rules()):
-        # 统一劫持根路由和幽灵路由
-        if rule.rule == '/' or rule.endpoint not in app.view_functions:
-            app.view_functions[rule.endpoint] = lambda **kwargs: catch_all_optimized(kwargs.get('path', ''))
-        
-        # 劫持所有带 path 的静态分发
-        elif '<path:path>' in rule.rule:
-            app.view_functions[rule.endpoint] = catch_all_optimized
-
-    print("Checking static files structure:")
-    for root, dirs, files in os.walk(STATIC_AUTH_DIR):
-        for f in files: print(f" - Found: {os.path.join(root, f)}")
-
+    print("Starting on 7860...")
     app.run(host='0.0.0.0', port=7860, threaded=True)
 EOF
 
 RUN chmod -R 777 /app
 ENV PORT=7860
-ENV PYTHONPATH=/app
 EXPOSE 7860
 
 CMD ["python", "hf_runner.py"]
