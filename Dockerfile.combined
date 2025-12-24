@@ -16,11 +16,11 @@ RUN pipreqs ./backend --force && \
     pip install --no-cache-dir -r ./backend/requirements.txt && \
     pip install --no-cache-dir python-pptx google-genai openai
 
-# === 阶段 3: 运行阶段 ===
+# === 阶段 3: 运行阶段 (平衡方案) ===
 FROM python:3.10-slim
 WORKDIR /app
 
-# 从阶段 2 拷贝环境
+# 拷贝依赖
 COPY --from=builder-backend /usr/local/lib/python3.10/site-packages /usr/local/lib/python3.10/site-packages
 COPY --from=builder-backend /usr/local/bin /usr/local/bin
 
@@ -31,29 +31,31 @@ COPY backend/ .
 RUN mkdir -p static
 COPY --from=frontend-builder /app/frontend/dist/ ./static/
 
-# --- 平衡前后端逻辑：使用可靠的脚本写入方式 ---
-RUN printf 'import os\n\
+# --- 核心平衡逻辑：创建一个独立的外壳文件来启动 Flask ---
+# 这样做避开了直接修改 app.py 时可能遇到的语法错误或转义问题
+RUN echo 'import os\n\
 from flask import send_from_directory\n\
-def apply_patch(app):\n\
-    @app.route("/", defaults={"path": ""})\n\
-    @app.route("/<path:path>")\n\
-    def serve(path):\n\
-        if path != "" and os.path.exists(os.path.join(app.static_folder, path)):\n\
-            return send_from_directory(app.static_folder, path)\n\
-        return send_from_directory(app.static_folder, "index.html")\n\
-' > patch_router.py
-
-# 修改 app.py：1. 调整 Flask 初始化；2. 避开原有的根路由；3. 注入新路由
-RUN python3 -c ' \
-path = "app.py"; \
-content = open(path).read(); \
-content = content.replace("app = Flask(__name__)", "app = Flask(__name__, static_folder=\"static\", static_url_path=\"/\")"); \
-content = content.replace("@app.route(\"/\")", "@app.route(\"/api/info\")"); \
-content += "\nfrom patch_router import apply_patch\napply_patch(app)\n"; \
-open(path, "w").write(content);'
+from app import app as original_app\n\
+\n\
+# 重新配置静态文件目录\n\
+original_app.static_folder = "static"\n\
+original_app.static_url_path = "/"\n\
+\n\
+@original_app.route("/", defaults={"path": ""})\n\
+@original_app.route("/<path:path>")\n\
+def serve_frontend(path):\n\
+    if path != "" and os.path.exists(os.path.join(original_app.static_folder, path)):\n\
+        return send_from_directory(original_app.static_folder, path)\n\
+    return send_from_directory(original_app.static_folder, "index.html")\n\
+\n\
+if __name__ == "__main__":\n\
+    port = int(os.environ.get("PORT", 5000))\n\
+    original_app.run(host="0.0.0.0", port=port)\n\
+' > run_combined.py
 
 ENV PORT=5000
 ENV PYTHONPATH=/app
 EXPOSE 5000
 
-CMD ["python", "app.py"]
+# 使用我们的新外壳启动
+CMD ["python", "run_combined.py"]
