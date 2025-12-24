@@ -16,63 +16,49 @@ RUN pipreqs ./backend --force && \
     pip install --no-cache-dir -r ./backend/requirements.txt && \
     pip install --no-cache-dir python-pptx google-genai openai flask-sqlalchemy flask-migrate
 
-# === 阶段 3: 运行阶段 (Hugging Face 专用) ===
+# === 阶段 3: 运行阶段 ===
 FROM python:3.10-slim
 WORKDIR /app
 
-# 1. 拷贝环境和源码
 COPY --from=builder-backend /usr/local/lib/python3.10/site-packages /usr/local/lib/python3.10/site-packages
 COPY --from=builder-backend /usr/local/bin /usr/local/bin
 COPY backend/ .
 
-# 2. 拷贝前端静态文件
+# 1. 准备前端静态文件
 RUN mkdir -p static
 COPY --from=frontend-builder /app/frontend/dist/ ./static/
 
-# 3. 创建入口脚本 (避开转义，使用单一命令写入文件)
-# 这个脚本会动态覆盖 app.py 的默认行为
+# 2. 【核心修复】强行改写 app.py，避开路由冲突
+# - 将 @app.route("/") 改为 @app.route("/api/info_status")，释放根路径
+# - 强制修改 app 初始化，加入 static 路径配置
+RUN sed -i 's/@app.route("/")/@app.route("\/api\/info_status")/g' app.py && \
+    sed -i 's/app = Flask(__name__)/app = Flask(__name__, static_folder="static", static_url_path="\/")/g' app.py
+
+# 3. 【核心修复】创建一个干净的引导程序，手动注入前端路由
 RUN printf "import os\n\
-import sys\n\
 from flask import send_from_directory\n\
+from app import app, db\n\
 \n\
-# 将当前目录加入路径并导入原 app\n\
-sys.path.append(os.getcwd())\n\
-try:\n\
-    from app import app, db\n\
-except ImportError:\n\
-    from app import app\n\
-    db = None\n\
-\n\
-# 强行覆盖静态文件配置\n\
-app.static_folder = 'static'\n\
-app.static_url_path = '/'\n\
-\n\
-# 数据库初始化\n\
+# 自动建表\n\
 with app.app_context():\n\
-    if db: \n\
-        try: db.create_all()\n\
-        except: pass\n\
+    try: db.create_all()\n\
+    except: pass\n\
 \n\
-# 定义前端托管路由 (它会作为兜底路由)\n\
+# 手动添加前端托管路由（此时 / 已经空出来了）\n\
 @app.route('/', defaults={'path': ''})\n\
 @app.route('/<path:path>')\n\
-def serve_frontend(path):\n\
-    full_path = os.path.join(app.static_folder, path)\n\
-    if path != '' and os.path.exists(full_path):\n\
+def serve(path):\n\
+    if path != '' and os.path.exists(os.path.join(app.static_folder, path)):\n\
         return send_from_directory(app.static_folder, path)\n\
     return send_from_directory(app.static_folder, 'index.html')\n\
 \n\
 if __name__ == '__main__':\n\
-    port = int(os.environ.get('PORT', 7860))\n\
-    app.run(host='0.0.0.0', port=port)\n\
+    app.run(host='0.0.0.0', port=7860)\n\
 " > hf_runner.py
 
-# 4. Hugging Face 权限处理
 RUN chmod -R 777 /app
-
 ENV PORT=7860
 ENV PYTHONPATH=/app
 EXPOSE 7860
 
-# 5. 启动点
 CMD ["python", "hf_runner.py"]
