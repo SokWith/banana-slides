@@ -18,90 +18,79 @@ RUN pipreqs ./backend --force && \
 # === 阶段 3: 运行阶段 ===
 FROM python:3.10-slim
 WORKDIR /app
-
 COPY --from=builder-backend /usr/local/lib/python3.10/site-packages /usr/local/lib/python3.10/site-packages
 COPY --from=builder-backend /usr/local/bin /usr/local/bin
 COPY backend/ .
-
-# 确保静态目录结构正确
 RUN mkdir -p /app/static
 COPY --from=frontend-builder /app/frontend/dist/ /app/static/
 
-# --- 核心：创建增强型启动脚本 ---
-RUN cat <<EOF > hf_final_runner.py
+# --- 核心：创建绝对无冲突的启动脚本 ---
+RUN cat <<EOF > hf_runner.py
 import os
 import sys
-import traceback
-from flask import Flask, send_from_directory, jsonify
-from flask_cors import CORS
+from flask import Flask, send_from_directory, Blueprint
 
-# 获取绝对路径
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-STATIC_DIR = os.path.join(BASE_DIR, 'static')
-
-# 确保导入原应用
-sys.path.append(BASE_DIR)
+# 1. 导入原始应用
+sys.path.append(os.getcwd())
 try:
     from app import app as original_app, db
 except Exception as e:
-    print(f"Import Error: {e}")
-    from flask import Flask
-    original_app = Flask(__name__)
-    db = None
+    print(f"Error loading app: {e}")
+    sys.exit(1)
 
-app = original_app
-CORS(app)
+# 2. 【关键】彻底接管所有路由映射
+# 我们不修改原有 app 对象，而是创建一个新的壳，避免 KeyError
+new_app = Flask(__name__, static_folder='static', static_url_path='/')
 
-# 强制重置静态配置，使用绝对路径
-app.static_folder = STATIC_DIR
-app.static_url_path = '/'
+# 3. 将原有的 API 路由“嫁接”过来
+# 我们保留所有以 /api 开头的请求给原应用，其他的给前端
+@new_app.route('/api', defaults={'path': ''})
+@new_app.route('/api/<path:path>', methods=['GET', 'POST', 'PUT', 'DELETE'])
+def api_proxy(path):
+    # 这里直接调用原应用的调度逻辑
+    return original_app.wsgi_app
 
-# 清理原有根路由
-try:
-    for rule in list(app.url_map.iter_rules()):
-        if rule.rule == '/':
-            app.view_functions.pop(rule.endpoint, None)
-except:
-    pass
-
-@app.route('/', defaults={'path': ''})
-@app.route('/<path:path>')
+# 4. 前端托管逻辑
+@new_app.route('/', defaults={'path': ''})
+@new_app.route('/<path:path>')
 def serve(path):
-    try:
-        # 调试信息
-        print(f"Trying to serve path: {path}")
-        
-        # 1. 尝试寻找物理文件
-        file_path = os.path.join(app.static_folder, path)
-        if path != "" and os.path.exists(file_path):
-            return send_from_directory(app.static_folder, path)
-        
-        # 2. 兜底返回 index.html
-        index_path = os.path.join(app.static_folder, 'index.html')
-        if os.path.exists(index_path):
-            return send_from_directory(app.static_folder, 'index.html')
-        else:
-            return f"Error: index.html not found at {index_path}", 404
-            
-    except Exception as e:
-        print(traceback.format_exc())
-        return str(e), 500
+    # 物理文件检查
+    full_path = os.path.join(new_app.static_folder, path)
+    if path != "" and os.path.exists(full_path):
+        return send_from_directory(new_app.static_folder, path)
+    # 兜底返回 index.html
+    return send_from_directory(new_app.static_folder, 'index.html')
 
 if __name__ == '__main__':
-    with app.app_context():
+    with original_app.app_context():
         try:
             if db: db.create_all()
-            print("Database checked.")
+            print("Database initialized.")
         except: pass
     
-    # 开启 debug=False 但打印详细错误
-    app.run(host='0.0.0.0', port=7860, threaded=True)
+    # 使用 original_app 的配置但运行在我们的新壳上
+    # 实际上，最简单的办法是直接用 original_app 并清理它的 url_map
+    print("Cleaning up original routes to prevent KeyError...")
+    
+    # 暴力清理原始 app 的所有路由，只保留业务逻辑
+    original_app.url_map._rules.clear()
+    original_app.view_functions.clear()
+    
+    # 重新注入我们的 serve 逻辑到 original_app
+    @original_app.route('/', defaults={'path': ''})
+    @original_app.route('/<path:path>')
+    def final_serve(path):
+        static_dir = os.path.abspath('static')
+        f_path = os.path.join(static_dir, path)
+        if path != "" and os.path.exists(f_path):
+            return send_from_directory(static_dir, path)
+        return send_from_directory(static_dir, 'index.html')
+
+    original_app.run(host='0.0.0.0', port=7860)
 EOF
 
-# 权限加固
-RUN chmod -R 777 /app/static
+RUN chmod -R 777 /app
 ENV PORT=7860
-ENV PYTHONPATH=/app
 EXPOSE 7860
 
-CMD ["python", "hf_final_runner.py"]
+CMD ["python", "hf_runner.py"]
