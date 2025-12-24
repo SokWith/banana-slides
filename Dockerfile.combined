@@ -1,49 +1,37 @@
 # === 阶段 1: 前端构建 ===
 FROM node:18-alpine AS frontend-builder
 WORKDIR /app/frontend
-
-# 拷贝并安装前端依赖
 COPY frontend/package*.json ./
 RUN npm install --prefer-offline --no-audit
-
-# 拷贝源码并构建
 COPY frontend/ ./
 ARG VITE_API_BASE_URL=/api
-# 使用 CI=false 避免将警告误认为错误导致构建中断
 RUN CI=false npm run build
 
-# === 阶段 2: 后端与合并运行 ===
+# === 阶段 2: 后端依赖扫描与安装 ===
 FROM python:3.10-slim
 WORKDIR /app
 
-# 1. 彻底补齐所有后端依赖
-# 增加 openai, 并确保 google-genai 处于最新状态
-RUN pip install --no-cache-dir \
-    flask \
-    flask-cors \
-    requests \
-    python-dotenv \
-    pillow \
-    tenacity \
-    sqlalchemy \
-    flask-sqlalchemy \
-    flask-migrate \
-    flask-marshmallow \
-    marshmallow-sqlalchemy \
-    google-genai \
-    openai
+# 安装扫描工具
+RUN pip install --no-cache-dir pipreqs
 
-# 2. 拷贝后端源码 (将 backend 目录下的内容直接放入 /app)
+# 拷贝后端代码进行扫描
+COPY backend/ ./backend/
+
+# 关键步骤：动态生成依赖列表并安装
+# 1. 用 pipreqs 扫描 backend 目录
+# 2. 手动补充一些 pipreqs 可能漏掉的特定包名（如 python-pptx）
+RUN pipreqs ./backend --force && \
+    pip install --no-cache-dir -r ./backend/requirements.txt && \
+    pip install --no-cache-dir python-pptx google-genai
+
+# === 阶段 3: 运行阶段 ===
+# 再次整理目录结构，确保 app.py 在根目录
 COPY backend/ .
-
-# 3. 托管前端静态文件
 RUN mkdir -p static
 COPY --from=frontend-builder /app/frontend/dist/ ./static/
 
-# 4. 运行配置
 ENV PORT=5000
 ENV PYTHONPATH=/app
 EXPOSE 5000
 
-# 启动
 CMD ["python", "app.py"]
