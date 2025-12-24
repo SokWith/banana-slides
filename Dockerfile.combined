@@ -1,14 +1,12 @@
-# === 阶段 1: 前端构建 ===
+# === 阶段 1 & 2 保持不变 ===
 FROM node:18-alpine AS frontend-builder
 WORKDIR /app/frontend
 COPY frontend/package*.json ./
 RUN npm install --prefer-offline --no-audit --legacy-peer-deps
 COPY frontend/ ./
-# 关键：在 Hugging Face 这种反向代理环境下，VITE_API_BASE_URL 必须设为空或 /api
 ARG VITE_API_BASE_URL=/api
 RUN CI=false npm run build
 
-# === 阶段 2: 后端依赖 ===
 FROM python:3.10-slim AS builder-backend
 WORKDIR /app
 RUN pip install --no-cache-dir pipreqs
@@ -17,7 +15,7 @@ RUN pipreqs ./backend --force && \
     pip install --no-cache-dir -r ./backend/requirements.txt && \
     pip install --no-cache-dir python-pptx google-genai openai flask-sqlalchemy flask-migrate flask-cors
 
-# === 阶段 3: 最终运行阶段 ===
+# === 阶段 3: 运行阶段 ===
 FROM python:3.10-slim
 WORKDIR /app
 
@@ -25,64 +23,83 @@ COPY --from=builder-backend /usr/local/lib/python3.10/site-packages /usr/local/l
 COPY --from=builder-backend /usr/local/bin /usr/local/bin
 COPY backend/ .
 
-# 准备静态文件
-RUN mkdir -p static
-COPY --from=frontend-builder /app/frontend/dist/ ./static/
+# 确保静态目录结构正确
+RUN mkdir -p /app/static
+COPY --from=frontend-builder /app/frontend/dist/ /app/static/
 
-# --- 核心：创建绝对平衡的启动脚本 ---
+# --- 核心：创建增强型启动脚本 ---
 RUN cat <<EOF > hf_final_runner.py
 import os
 import sys
+import traceback
 from flask import Flask, send_from_directory, jsonify
 from flask_cors import CORS
 
-# 确保能导入原有的业务代码
-sys.path.append(os.getcwd())
+# 获取绝对路径
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+STATIC_DIR = os.path.join(BASE_DIR, 'static')
+
+# 确保导入原应用
+sys.path.append(BASE_DIR)
 try:
     from app import app as original_app, db
-except ImportError:
-    # 兼容处理：如果 app.py 里实例化 Flask 的对象不叫 app
-    import app as app_module
-    original_app = getattr(app_module, 'app', None) or getattr(app_module, 'server', None)
-    db = getattr(app_module, 'db', None)
+except Exception as e:
+    print(f"Import Error: {e}")
+    from flask import Flask
+    original_app = Flask(__name__)
+    db = None
 
 app = original_app
-# 1. 强制开启 CORS，解决 "Failed to fetch"
 CORS(app)
 
-# 2. 彻底清理冲突路由
-# 遍历路由映射，凡是抢占根目录 "/" 的全部干掉
-for rule in list(app.url_map.iter_rules()):
-    if rule.rule == '/':
-        app.view_functions.pop(rule.endpoint, None)
-
-# 3. 静态文件配置
-app.static_folder = 'static'
+# 强制重置静态配置，使用绝对路径
+app.static_folder = STATIC_DIR
 app.static_url_path = '/'
 
-# 4. 数据库初始化
-with app.app_context():
-    try:
-        if db: db.create_all()
-        print("Database initialized successfully.")
-    except Exception as e:
-        print(f"DB Init Note: {e}")
+# 清理原有根路由
+try:
+    for rule in list(app.url_map.iter_rules()):
+        if rule.rule == '/':
+            app.view_functions.pop(rule.endpoint, None)
+except:
+    pass
 
-# 5. 前端兜底路由
 @app.route('/', defaults={'path': ''})
 @app.route('/<path:path>')
 def serve(path):
-    full_path = os.path.join(app.static_folder, path)
-    if path != "" and os.path.exists(full_path):
-        return send_from_directory(app.static_folder, path)
-    return send_from_directory(app.static_folder, 'index.html')
+    try:
+        # 调试信息
+        print(f"Trying to serve path: {path}")
+        
+        # 1. 尝试寻找物理文件
+        file_path = os.path.join(app.static_folder, path)
+        if path != "" and os.path.exists(file_path):
+            return send_from_directory(app.static_folder, path)
+        
+        # 2. 兜底返回 index.html
+        index_path = os.path.join(app.static_folder, 'index.html')
+        if os.path.exists(index_path):
+            return send_from_directory(app.static_folder, 'index.html')
+        else:
+            return f"Error: index.html not found at {index_path}", 404
+            
+    except Exception as e:
+        print(traceback.format_exc())
+        return str(e), 500
 
 if __name__ == '__main__':
-    # Hugging Face 必须使用 7860
+    with app.app_context():
+        try:
+            if db: db.create_all()
+            print("Database checked.")
+        except: pass
+    
+    # 开启 debug=False 但打印详细错误
     app.run(host='0.0.0.0', port=7860, threaded=True)
 EOF
 
-RUN chmod -R 777 /app
+# 权限加固
+RUN chmod -R 777 /app/static
 ENV PORT=7860
 ENV PYTHONPATH=/app
 EXPOSE 7860
