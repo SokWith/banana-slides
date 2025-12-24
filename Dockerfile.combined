@@ -4,11 +4,10 @@ WORKDIR /app/frontend
 COPY frontend/package*.json ./
 RUN npm install --prefer-offline --no-audit --legacy-peer-deps
 COPY frontend/ ./
-# 注意：Hugging Face 最好使用相对路径 /api 
 ARG VITE_API_BASE_URL=/api
 RUN CI=false npm run build
 
-# === 阶段 2: 后端依赖扫描与安装 ===
+# === 阶段 2: 后端依赖 ===
 FROM python:3.10-slim AS builder-backend
 WORKDIR /app
 RUN pip install --no-cache-dir pipreqs
@@ -17,7 +16,7 @@ RUN pipreqs ./backend --force && \
     pip install --no-cache-dir -r ./backend/requirements.txt && \
     pip install --no-cache-dir python-pptx google-genai openai flask-sqlalchemy flask-migrate
 
-# === 阶段 3: 运行阶段 (Hugging Face 适配版) ===
+# === 阶段 3: 运行阶段 (Hugging Face 专用) ===
 FROM python:3.10-slim
 WORKDIR /app
 
@@ -26,59 +25,54 @@ COPY --from=builder-backend /usr/local/lib/python3.10/site-packages /usr/local/l
 COPY --from=builder-backend /usr/local/bin /usr/local/bin
 COPY backend/ .
 
-# 2. 拷贝前端静态文件到 /app/static
+# 2. 拷贝前端静态文件
 RUN mkdir -p static
 COPY --from=frontend-builder /app/frontend/dist/ ./static/
 
-# 3. 【核心修复】强制修改 app.py 路由逻辑
-# 这段脚本会：
-# - 寻找并注释掉所有原有的首页路由 @app.route("/")
-# - 修改 Flask 初始化参数，强制指定静态文件夹
-RUN python3 -c ' \
-import os; \
-path = "app.py"; \
-with open(path, "r") as f: lines = f.readlines(); \
-new_lines = []; \
-for line in lines: \
-    if "app = Flask(__name__)" in line: \
-        new_lines.append("app = Flask(__name__, static_folder=\"static\", static_url_path=\"/\")\n") \
-    elif "@app.route(\"/\")" in line: \
-        new_lines.append("# @app.route(\"/\") - Disabled for Frontend Balance\n") \
-    elif "return jsonify({" in line and "#" not in line: \
-        new_lines.append("        return jsonify({\"status\":\"API active\"}) # Modified\n") \
-    else: \
-        new_lines.append(line) \
-with open(path, "w") as f: f.writelines(new_lines); \
-'
-
-# 4. 【核心启动脚本】处理 Hugging Face 的 7860 端口并初始化 DB
-RUN printf 'import os\n\
+# 3. 创建入口脚本 (避开转义，使用单一命令写入文件)
+# 这个脚本会动态覆盖 app.py 的默认行为
+RUN printf "import os\n\
+import sys\n\
 from flask import send_from_directory\n\
-from app import app, db\n\
 \n\
+# 将当前目录加入路径并导入原 app\n\
+sys.path.append(os.getcwd())\n\
+try:\n\
+    from app import app, db\n\
+except ImportError:\n\
+    from app import app\n\
+    db = None\n\
+\n\
+# 强行覆盖静态文件配置\n\
+app.static_folder = 'static'\n\
+app.static_url_path = '/'\n\
+\n\
+# 数据库初始化\n\
 with app.app_context():\n\
-    try: db.create_all()\n\
-    except Exception as e: print(f"DB Init error: {e}")\n\
+    if db: \n\
+        try: db.create_all()\n\
+        except: pass\n\
 \n\
-@app.route("/", defaults={"path": ""})\n\
-@app.route("/<path:path>")\n\
+# 定义前端托管路由 (它会作为兜底路由)\n\
+@app.route('/', defaults={'path': ''})\n\
+@app.route('/<path:path>')\n\
 def serve_frontend(path):\n\
     full_path = os.path.join(app.static_folder, path)\n\
-    if path != "" and os.path.exists(full_path):\n\
+    if path != '' and os.path.exists(full_path):\n\
         return send_from_directory(app.static_folder, path)\n\
-    return send_from_directory(app.static_folder, "index.html")\n\
+    return send_from_directory(app.static_folder, 'index.html')\n\
 \n\
-if __name__ == "__main__":\n\
-    # Hugging Face 默认端口是 7860\n\
-    port = int(os.environ.get("PORT", 7860))\n\
-    app.run(host="0.0.0.0", port=port)\n\
-' > run_hf.py
+if __name__ == '__main__':\n\
+    port = int(os.environ.get('PORT', 7860))\n\
+    app.run(host='0.0.0.0', port=port)\n\
+" > hf_runner.py
 
-# 5. Hugging Face 权限设置（必须，否则 static 下的文件无法访问）
+# 4. Hugging Face 权限处理
 RUN chmod -R 777 /app
 
 ENV PORT=7860
 ENV PYTHONPATH=/app
 EXPOSE 7860
 
-CMD ["python", "run_hf.py"]
+# 5. 启动点
+CMD ["python", "hf_runner.py"]
