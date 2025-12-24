@@ -2,9 +2,11 @@
 FROM node:18-alpine AS frontend-builder
 WORKDIR /app/frontend
 COPY frontend/package*.json ./
-RUN npm install --prefer-offline --no-audit
+# 使用 --legacy-peer-deps 解决可能存在的插件冲突
+RUN npm install --prefer-offline --no-audit --legacy-peer-deps
 COPY frontend/ ./
 ARG VITE_API_BASE_URL=/api
+# CI=false 防止将警告（Warning）视为错误（Error）
 RUN CI=false npm run build
 
 # === 阶段 2: 后端依赖扫描与安装 ===
@@ -12,50 +14,67 @@ FROM python:3.10-slim AS builder-backend
 WORKDIR /app
 RUN pip install --no-cache-dir pipreqs
 COPY backend/ ./backend/
+# 自动扫描依赖并手动补齐关键库
 RUN pipreqs ./backend --force && \
     pip install --no-cache-dir -r ./backend/requirements.txt && \
-    pip install --no-cache-dir python-pptx google-genai openai
+    pip install --no-cache-dir python-pptx google-genai openai flask-sqlalchemy flask-migrate
 
-# === 阶段 3: 运行阶段 (平衡方案) ===
+# === 阶段 3: 最终运行阶段 ===
 FROM python:3.10-slim
 WORKDIR /app
 
-# 拷贝依赖
+# 1. 拷贝 Python 环境依赖
 COPY --from=builder-backend /usr/local/lib/python3.10/site-packages /usr/local/lib/python3.10/site-packages
 COPY --from=builder-backend /usr/local/bin /usr/local/bin
 
-# 拷贝后端源码
+# 2. 拷贝后端源码
 COPY backend/ .
 
-# 拷贝前端产物
+# 3. 准备前端静态文件
 RUN mkdir -p static
 COPY --from=frontend-builder /app/frontend/dist/ ./static/
 
-# --- 核心平衡逻辑：创建一个独立的外壳文件来启动 Flask ---
-# 这样做避开了直接修改 app.py 时可能遇到的语法错误或转义问题
-RUN echo 'import os\n\
+# 4. 核心：创建平衡前后端的启动脚本
+# 该脚本会：
+# - 自动在启动前创建数据库表（解决 no such table 报错）
+# - 强制 Flask 托管静态文件（解决前端不显示问题）
+# - 维持 API 路由优先级
+RUN printf 'import os\n\
 from flask import send_from_directory\n\
-from app import app as original_app\n\
+try:\n\
+    from app import app, db\n\
+except ImportError:\n\
+    from app import app\n\
+    db = None\n\
 \n\
-# 重新配置静态文件目录\n\
-original_app.static_folder = "static"\n\
-original_app.static_url_path = "/"\n\
+# 初始化数据库（解决 settings 表缺失）\n\
+with app.app_context():\n\
+    if db:\n\
+        try:\n\
+            db.create_all()\n\
+            print("Database initialized.")\n\
+        except Exception as e: print(f"DB Init Warning: {e}")\n\
 \n\
-@original_app.route("/", defaults={"path": ""})\n\
-@original_app.route("/<path:path>")\n\
+# 配置前端托管\n\
+app.static_folder = "static"\n\
+app.static_url_path = "/"\n\
+\n\
+# 拦截所有非 API 请求返回前端 index.html\n\
+@app.route("/", defaults={"path": ""})\n\
+@app.route("/<path:path>")\n\
 def serve_frontend(path):\n\
-    if path != "" and os.path.exists(os.path.join(original_app.static_folder, path)):\n\
-        return send_from_directory(original_app.static_folder, path)\n\
-    return send_from_directory(original_app.static_folder, "index.html")\n\
+    if path != "" and os.path.exists(os.path.join(app.static_folder, path)):\n\
+        return send_from_directory(app.static_folder, path)\n\
+    return send_from_directory(app.static_folder, "index.html")\n\
 \n\
 if __name__ == "__main__":\n\
-    port = int(os.environ.get("PORT", 5000))\n\
-    original_app.run(host="0.0.0.0", port=port)\n\
-' > run_combined.py
+    app.run(host="0.0.0.0", port=5000)\n\
+' > run_final.py
 
+# 5. 运行配置
 ENV PORT=5000
 ENV PYTHONPATH=/app
 EXPOSE 5000
 
-# 使用我们的新外壳启动
-CMD ["python", "run_combined.py"]
+# 启动定制的平衡脚本
+CMD ["python", "run_final.py"]
