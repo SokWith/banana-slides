@@ -1,4 +1,4 @@
-# === 阶段 1: 前端构建 ===
+# === 阶段 1: 构建前端 ===
 FROM node:18-alpine AS frontend-builder
 WORKDIR /app/frontend
 COPY frontend/package*.json ./
@@ -7,77 +7,69 @@ COPY frontend/ ./
 ARG VITE_API_BASE_URL=/api
 RUN CI=false npm run build
 
-# === 阶段 2: 后端依赖 ===
+# === 阶段 2: 准备后端环境 ===
 FROM python:3.10-slim AS builder-backend
 WORKDIR /app
-RUN pip install --no-cache-dir pipreqs
-COPY backend/ ./backend/
-RUN pipreqs ./backend --force && \
-    pip install --no-cache-dir -r ./backend/requirements.txt && \
-    pip install --no-cache-dir python-pptx google-genai openai flask-sqlalchemy flask-migrate flask-cors werkzeug
+COPY backend/requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt && \
+    pip install --no-cache-dir flask-cors gunicorn
 
-# === 阶段 3: 运行阶段 ===
+# === 阶段 3: 运行镜像 ===
 FROM python:3.10-slim
 WORKDIR /app
 
+# 拷贝后端依赖和代码
 COPY --from=builder-backend /usr/local/lib/python3.10/site-packages /usr/local/lib/python3.10/site-packages
 COPY --from=builder-backend /usr/local/bin /usr/local/bin
 COPY backend/ .
 
-# 关键：我们将前端 dist 直接重命名为 backend 下的 static 文件夹
-RUN rm -rf static && mkdir -p static
-COPY --from=frontend-builder /app/frontend/dist/ ./static/
+# 关键：将前端 dist 拷贝到后端能访问的 static 目录
+RUN mkdir -p /app/static
+COPY --from=frontend-builder /app/frontend/dist/ /app/static/
 
-# --- 创建启动脚本 ---
-RUN cat <<EOF > hf_runner.py
+# --- 创建新的入口脚本 entrypoint.py ---
+RUN cat <<EOF > entrypoint.py
 import os
 import sys
 from flask import Flask, send_from_directory
 from flask_cors import CORS
 
-# 1. 加载应用
+# 1. 加载你修改后的 app
 sys.path.append(os.getcwd())
 try:
     from app import app, db
-    print("Backend app loaded.")
 except Exception as e:
-    print(f"Error: {e}")
+    print(f"Error loading app: {e}")
     sys.exit(1)
 
 CORS(app)
+# 锁定静态资源文件夹
+STATIC_DIR = os.path.abspath('static')
+app.static_folder = STATIC_DIR
 
-# 2. 【核心点】强制配置 Flask 原生静态分发
-# 把 static 文件夹作为根路径分发
-app.static_folder = os.path.abspath('static')
-app.static_url_path = '/' 
-
-# 3. 拦截所有不匹配的路由，返回 index.html (支持 SPA)
-@app.errorhandler(404)
-def handle_404(e):
-    # 如果是 API 报错，返回 JSON
-    if request.path.startswith('/api'):
-        return {"error": "Not found"}, 404
-    # 否则返回前端入口
-    return send_from_directory(app.static_folder, 'index.html')
-
-# 4. 补齐首页路由（防止被原有逻辑拦截）
+# 2. 接管前端路由
 @app.route('/')
-def hf_index():
-    return send_from_directory(app.static_folder, 'index.html')
+def serve_index():
+    return send_from_directory(STATIC_DIR, 'index.html')
+
+@app.route('/<path:path>')
+def serve_assets(path):
+    # 尝试寻找物理文件 (assets/..., logo.png 等)
+    full_path = os.path.join(STATIC_DIR, path)
+    if os.path.exists(full_path) and os.path.isfile(full_path):
+        return send_from_directory(STATIC_DIR, path)
+    
+    # 如果不是 API 请求，且文件不存在，返回 index.html 支持 SPA 路由
+    if not path.startswith('api/'):
+        return send_from_directory(STATIC_DIR, 'index.html')
+    
+    return {"error": "Not Found"}, 404
 
 if __name__ == '__main__':
     with app.app_context():
         try:
-            db.create_all()
-            print("Database ready.")
+            db.create_all() # 确保数据库表存在
         except: pass
-
-    # 打印一下物理路径确保万无一失
-    asset_path = os.path.join(app.static_folder, 'assets')
-    if os.path.exists(asset_path):
-        print(f"Assets dir content: {os.listdir(asset_path)}")
-
-    print("Starting on 7860...")
     app.run(host='0.0.0.0', port=7860, threaded=True)
 EOF
 
@@ -85,4 +77,4 @@ RUN chmod -R 777 /app
 ENV PORT=7860
 EXPOSE 7860
 
-CMD ["python", "hf_runner.py"]
+CMD ["python", "entrypoint.py"]
