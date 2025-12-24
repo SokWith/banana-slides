@@ -1,19 +1,18 @@
 # === 阶段 1: 前端构建 ===
 FROM node:18-alpine AS frontend-builder
 WORKDIR /app
-# 拷贝前端代码
+# 按照前端 Dockerfile 逻辑
 COPY frontend/package*.json ./frontend/
 RUN cd frontend && npm install
 COPY frontend/ ./frontend/
-# 执行构建
 ARG VITE_API_BASE_URL=/api
 RUN cd frontend && npm run build
 
-# === 阶段 2: 后端与运行 (基于原版 backend/Dockerfile 逻辑) ===
+# === 阶段 2: 后端与运行 ===
 FROM python:3.10-slim
 WORKDIR /app
 
-# 1. 安装原版指定的后端依赖
+# 1. 安装依赖 (原版列表 + 补齐缺失的 sqlalchemy 系列)
 RUN pip install --no-cache-dir \
     flask \
     flask-cors \
@@ -21,14 +20,15 @@ RUN pip install --no-cache-dir \
     google-generativeai \
     python-dotenv \
     pillow \
-    tenacity
+    tenacity \
+    sqlalchemy \
+    flask-sqlalchemy
 
-# 2. 拷贝后端源码到容器的 /app 目录下
-# 注意：原版 Dockerfile 是把 backend 下的内容考到 WORKDIR
+# 2. 拷贝后端源码 (模仿原版：将 backend 目录下的内容直接放入 /app)
 COPY backend/ .
 
-# 3. 处理前端静态文件
-# 强制创建静态目录并将前端产物拷贝进去
+# 3. 托管前端静态文件
+# 将前端构建好的 dist 文件夹拷贝到后端寻找静态文件的默认目录 'static'
 RUN mkdir -p static
 COPY --from=frontend-builder /app/frontend/dist/ ./static/
 
@@ -36,5 +36,5 @@ COPY --from=frontend-builder /app/frontend/dist/ ./static/
 ENV PORT=5000
 EXPOSE 5000
 
-# 5. 启动 (参考原版，直接在根目录下运行 app.py)
+# 直接运行，因为源码已经考到了 /app 根目录
 CMD ["python", "app.py"]
