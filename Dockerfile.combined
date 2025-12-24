@@ -4,82 +4,87 @@ WORKDIR /app/frontend
 COPY frontend/package*.json ./
 RUN npm install --prefer-offline --no-audit --legacy-peer-deps
 COPY frontend/ ./
-# VITE_API_BASE_URL 留空或设为 /api，让前端请求相对路径
+# 关键：在 Hugging Face 这种反向代理环境下，VITE_API_BASE_URL 必须设为空或 /api
 ARG VITE_API_BASE_URL=/api
 RUN CI=false npm run build
 
-# === 阶段 2: 后端依赖扫描与安装 ===
+# === 阶段 2: 后端依赖 ===
 FROM python:3.10-slim AS builder-backend
 WORKDIR /app
 RUN pip install --no-cache-dir pipreqs
 COPY backend/ ./backend/
 RUN pipreqs ./backend --force && \
     pip install --no-cache-dir -r ./backend/requirements.txt && \
-    pip install --no-cache-dir python-pptx google-genai openai flask-sqlalchemy flask-migrate
+    pip install --no-cache-dir python-pptx google-genai openai flask-sqlalchemy flask-migrate flask-cors
 
-# === 阶段 3: 运行阶段 (彻底平衡方案) ===
+# === 阶段 3: 最终运行阶段 ===
 FROM python:3.10-slim
 WORKDIR /app
 
-# 1. 拷贝依赖
 COPY --from=builder-backend /usr/local/lib/python3.10/site-packages /usr/local/lib/python3.10/site-packages
 COPY --from=builder-backend /usr/local/bin /usr/local/bin
-
-# 2. 拷贝后端代码
 COPY backend/ .
 
-# 3. 准备前端静态文件 (确保路径为 /app/static)
+# 准备静态文件
 RUN mkdir -p static
 COPY --from=frontend-builder /app/frontend/dist/ ./static/
 
-# 4. 【核心重写】生成一个干净的启动脚本 app_hf.py
-# 使用 EOF 避免所有引号转义问题，直接定义路由优先级
-RUN cat <<EOF > app_hf.py
+# --- 核心：创建绝对平衡的启动脚本 ---
+RUN cat <<EOF > hf_final_runner.py
 import os
+import sys
 from flask import Flask, send_from_directory, jsonify
-# 导入原本的蓝图和配置 (假设原 app.py 中有这些)
-from app import app as original_app, db
+from flask_cors import CORS
 
-# 创建一个新的 Flask 容器来包装原有的路由
-app = original_app 
+# 确保能导入原有的业务代码
+sys.path.append(os.getcwd())
+try:
+    from app import app as original_app, db
+except ImportError:
+    # 兼容处理：如果 app.py 里实例化 Flask 的对象不叫 app
+    import app as app_module
+    original_app = getattr(app_module, 'app', None) or getattr(app_module, 'server', None)
+    db = getattr(app_module, 'db', None)
+
+app = original_app
+# 1. 强制开启 CORS，解决 "Failed to fetch"
+CORS(app)
+
+# 2. 彻底清理冲突路由
+# 遍历路由映射，凡是抢占根目录 "/" 的全部干掉
+for rule in list(app.url_map.iter_rules()):
+    if rule.rule == '/':
+        app.view_functions.pop(rule.endpoint, None)
+
+# 3. 静态文件配置
 app.static_folder = 'static'
 app.static_url_path = '/'
 
-# 移除原有的根路由逻辑，防止它拦截前端
-for rule in list(app.url_map.iter_rules()):
-    if rule.endpoint == 'index' or rule.rule == '/':
-        # 这里尝试清理掉旧的根路由冲突
-        pass
-
-# 数据库初始化
+# 4. 数据库初始化
 with app.app_context():
     try:
-        db.create_all()
-        print("Database Initialized.")
-    except:
-        pass
+        if db: db.create_all()
+        print("Database initialized successfully.")
+    except Exception as e:
+        print(f"DB Init Note: {e}")
 
-# 强制定义新的平衡路由
+# 5. 前端兜底路由
 @app.route('/', defaults={'path': ''})
 @app.route('/<path:path>')
 def serve(path):
-    # 1. 如果路径在 static 文件夹里物理存在（如 assets/index.js）
     full_path = os.path.join(app.static_folder, path)
     if path != "" and os.path.exists(full_path):
         return send_from_directory(app.static_folder, path)
-    # 2. 否则统一返回 index.html (支持 SPA)
     return send_from_directory(app.static_folder, 'index.html')
 
 if __name__ == '__main__':
     # Hugging Face 必须使用 7860
-    app.run(host='0.0.0.0', port=7860)
+    app.run(host='0.0.0.0', port=7860, threaded=True)
 EOF
 
-# 5. 设置权限与环境
 RUN chmod -R 777 /app
 ENV PORT=7860
 ENV PYTHONPATH=/app
 EXPOSE 7860
 
-# 6. 使用重写后的脚本启动
-CMD ["python", "app_hf.py"]
+CMD ["python", "hf_final_runner.py"]
