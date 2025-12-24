@@ -11,8 +11,8 @@ RUN cd frontend && npm run build
 FROM python:3.10-slim
 WORKDIR /app
 
-# 1. 安装后端必要的 Python 依赖库
-# 补齐了 sqlalchemy, flask-sqlalchemy, flask-migrate 等常见数据库包
+# 1. 安装后端 Python 依赖库
+# 补齐了之前报错的 tenacity，以及根据代码路径推测出的相关库
 RUN pip install --no-cache-dir \
     flask \
     flask-cors \
@@ -22,7 +22,11 @@ RUN pip install --no-cache-dir \
     python-dotenv \
     requests \
     google-generativeai \
-    pillow
+    pillow \
+    tenacity \
+    marshmallow \
+    flask-marshmallow \
+    marshmallow-sqlalchemy
 
 # 2. 拷贝后端源码
 COPY backend/ /app/backend/
@@ -37,4 +41,6 @@ EXPOSE 5000
 
 # 切换到后端目录启动
 WORKDIR /app/backend
+# 增加 PYTHONPATH 确保能够正确导入同级目录下的 controllers, services 等模块
+ENV PYTHONPATH=/app/backend
 CMD ["python", "app.py"]
