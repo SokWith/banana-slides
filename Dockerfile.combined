@@ -12,10 +12,13 @@ FROM python:3.10-slim
 WORKDIR /app
 
 # 1. 安装后端必要的 Python 依赖库
-# 根据报错信息，我们需要 python-dotenv，同时补上 Flask 运行环境
+# 补齐了 sqlalchemy, flask-sqlalchemy, flask-migrate 等常见数据库包
 RUN pip install --no-cache-dir \
     flask \
     flask-cors \
+    flask-sqlalchemy \
+    flask-migrate \
+    sqlalchemy \
     python-dotenv \
     requests \
     google-generativeai \
