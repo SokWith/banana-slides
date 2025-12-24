@@ -7,28 +7,45 @@ COPY frontend/ ./
 ARG VITE_API_BASE_URL=/api
 RUN CI=false npm run build
 
-# === 阶段 2: 后端与运行 ===
+# === 阶段 2: 后端依赖扫描与安装 ===
+FROM python:3.10-slim
+WORKDIR /app
+RUN pip install --no-cache-dir pipreqs
+COPY backend/ ./backend/
+RUN pipreqs ./backend --force && \
+    pip install --no-cache-dir -r ./backend/requirements.txt && \
+    pip install --no-cache-dir python-pptx google-genai openai
+
+# === 阶段 3: 运行阶段（增加前后端平衡逻辑） ===
 FROM python:3.10-slim
 WORKDIR /app
 
-# 1. 一次性补全所有发现的依赖（包括最新的 python-pptx）
-RUN pip install --no-cache-dir \
-    flask flask-cors requests python-dotenv pillow tenacity \
-    sqlalchemy flask-sqlalchemy flask-migrate flask-marshmallow \
-    marshmallow-sqlalchemy google-genai openai python-pptx
+# 从阶段 2 拷贝已安装的依赖（利用缓存）
+COPY --from=1 /usr/local/lib/python3.10/site-packages /usr/local/lib/python3.10/site-packages
+COPY --from=1 /usr/local/bin /usr/local/bin
 
-# 2. 拷贝后端源码
+# 拷贝后端源码
 COPY backend/ .
 
-# 3. 核心修复：修改 app.py 以支持前端托管
-# 我们把原有的根路由改为返回静态文件，或者直接删掉它让 Flask 使用默认静态逻辑
-RUN sed -i 's/return jsonify({/return app.send_static_file("index.html") #/g' app.py
-
-# 4. 托管前端静态文件
+# 拷贝前端产物到 static 目录
 RUN mkdir -p static
 COPY --from=frontend-builder /app/frontend/dist/ ./static/
 
-# 5. 运行配置
+# --- 核心平衡脚本 ---
+# 使用 python 直接修改 app.py，确保 Flask 指向正确的静态目录并优先服务前端
+RUN python3 -c ' \
+import os; \
+path = "app.py"; \
+content = open(path).read(); \
+# 1. 强制 Flask 初始化时检查 static 目录 \
+content = content.replace("app = Flask(__name__)", "app = Flask(__name__, static_folder=\"static\", static_url_path=\"/\")"); \
+# 2. 将原本返回 JSON 的根路由改名为 /api/info，并释放 / 给前端 \
+content = content.replace("@app.route(\"/\")", "@app.route(\"/api/info\")"); \
+# 3. 在文件末尾添加托管前端 index.html 的万能路由 \
+content += "\n@app.route(\"/\", defaults={\"path\": \"\"})\n@app.route(\"/<path:path>\")\ndef serve(path):\n    if path != \"\" and os.exists(os.path.join(app.static_folder, path)):\n        return send_from_directory(app.static_folder, path)\n    else:\n        return send_from_directory(app.static_folder, \"index.html\")\n"; \
+with open(path, "w") as f: f.write("from flask import send_from_directory\nimport os\n" + content) \
+'
+
 ENV PORT=5000
 ENV PYTHONPATH=/app
 EXPOSE 5000
