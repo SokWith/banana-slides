@@ -1,7 +1,6 @@
 # === 阶段 1: 前端构建 ===
 FROM node:18-alpine AS frontend-builder
 WORKDIR /app
-# 拷贝前端代码并构建
 COPY frontend/package*.json ./frontend/
 RUN cd frontend && npm install
 COPY frontend/ ./frontend/
@@ -12,22 +11,24 @@ RUN cd frontend && npm run build
 FROM python:3.10-slim
 WORKDIR /app
 
-# 1. 尝试安装后端依赖
-# 检查：如果后端有 requirements.txt 则安装，没有则跳过
-# 这种写法可以防止因为找不到文件而导致构建失败
-COPY backend/ /app/backend/
-RUN if [ -f /app/backend/requirements.txt ]; then \
-        pip install --no-cache-dir -r /app/backend/requirements.txt; \
-    else \
-        pip install --no-cache-dir flask flask-cors requests; \
-    fi
+# 1. 安装后端必要的 Python 依赖库
+# 根据报错信息，我们需要 python-dotenv，同时补上 Flask 运行环境
+RUN pip install --no-cache-dir \
+    flask \
+    flask-cors \
+    python-dotenv \
+    requests \
+    google-generativeai \
+    pillow
 
-# 2. 拷贝前端静态产物到后端托管目录
-# 强制创建后端存放静态文件的目录 (通常后端 app.py 会查找 static 文件夹)
+# 2. 拷贝后端源码
+COPY backend/ /app/backend/
+
+# 3. 合并前端产物
 RUN mkdir -p /app/backend/static
 COPY --from=frontend-builder /app/frontend/dist/ /app/backend/static/
 
-# 3. 设置运行环境
+# 4. 运行配置
 ENV PORT=5000
 EXPOSE 5000
 
