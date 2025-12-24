@@ -8,7 +8,7 @@ ARG VITE_API_BASE_URL=/api
 RUN CI=false npm run build
 
 # === 阶段 2: 后端依赖扫描与安装 ===
-FROM python:3.10-slim
+FROM python:3.10-slim AS builder-backend
 WORKDIR /app
 RUN pip install --no-cache-dir pipreqs
 COPY backend/ ./backend/
@@ -16,35 +16,41 @@ RUN pipreqs ./backend --force && \
     pip install --no-cache-dir -r ./backend/requirements.txt && \
     pip install --no-cache-dir python-pptx google-genai openai
 
-# === 阶段 3: 运行阶段（增加前后端平衡逻辑） ===
+# === 阶段 3: 运行阶段 ===
 FROM python:3.10-slim
 WORKDIR /app
 
-# 从阶段 2 拷贝已安装的依赖（利用缓存）
-COPY --from=1 /usr/local/lib/python3.10/site-packages /usr/local/lib/python3.10/site-packages
-COPY --from=1 /usr/local/bin /usr/local/bin
+# 从阶段 2 拷贝环境
+COPY --from=builder-backend /usr/local/lib/python3.10/site-packages /usr/local/lib/python3.10/site-packages
+COPY --from=builder-backend /usr/local/bin /usr/local/bin
 
 # 拷贝后端源码
 COPY backend/ .
 
-# 拷贝前端产物到 static 目录
+# 拷贝前端产物
 RUN mkdir -p static
 COPY --from=frontend-builder /app/frontend/dist/ ./static/
 
-# --- 核心平衡脚本 ---
-# 使用 python 直接修改 app.py，确保 Flask 指向正确的静态目录并优先服务前端
+# --- 平衡前后端逻辑：使用可靠的脚本写入方式 ---
+RUN printf 'import os\n\
+from flask import send_from_directory\n\
+def apply_patch(app):\n\
+    @app.route("/", defaults={"path": ""})\n\
+    @app.route("/<path:path>")\n\
+    def serve(path):\n\
+        if path != "" and os.path.exists(os.path.join(app.static_folder, path)):\n\
+            return send_from_directory(app.static_folder, path)\n\
+        return send_from_directory(app.static_folder, "index.html")\n\
+' > patch_router.py
+
+# 修改 app.py：1. 调整 Flask 初始化；2. 避开原有的根路由；3. 注入新路由
 RUN python3 -c ' \
-import os; \
 path = "app.py"; \
 content = open(path).read(); \
-# 1. 强制 Flask 初始化时检查 static 目录 \
 content = content.replace("app = Flask(__name__)", "app = Flask(__name__, static_folder=\"static\", static_url_path=\"/\")"); \
-# 2. 将原本返回 JSON 的根路由改名为 /api/info，并释放 / 给前端 \
 content = content.replace("@app.route(\"/\")", "@app.route(\"/api/info\")"); \
-# 3. 在文件末尾添加托管前端 index.html 的万能路由 \
-content += "\n@app.route(\"/\", defaults={\"path\": \"\"})\n@app.route(\"/<path:path>\")\ndef serve(path):\n    if path != \"\" and os.exists(os.path.join(app.static_folder, path)):\n        return send_from_directory(app.static_folder, path)\n    else:\n        return send_from_directory(app.static_folder, \"index.html\")\n"; \
-with open(path, "w") as f: f.write("from flask import send_from_directory\nimport os\n" + content) \
-'
+content += "\nfrom patch_router import apply_patch\napply_patch(app)\n"; \
+open(path, "w").write(content);'
 
 ENV PORT=5000
 ENV PYTHONPATH=/app
